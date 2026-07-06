@@ -1,10 +1,9 @@
 import math
 import sys
 import tkinter as tk
-from tkinter import scrolledtext, simpledialog
+from tkinter import scrolledtext, simpledialog, messagebox
 import requests
 
-# サーバー上のダミーCardをモック化
 class CardMock:
     def __init__(self, suit, rank):
         self.suit = suit
@@ -40,12 +39,6 @@ class BoardPopup:
         self.send_btn = tk.Button(input_frame, text="送信", command=self.send_message, bg="#4caf50", fg="white", font=("Arial", 9, "bold"))
         self.send_btn.pack(side=tk.RIGHT)
 
-    def add_message(self, message):
-        self.text_area.config(state=tk.NORMAL)
-        self.text_area.insert(tk.END, f" {message}\n")
-        self.text_area.see(tk.END)
-        self.text_area.config(state=tk.DISABLED)
-
     def update_chat_logs(self, logs):
         self.text_area.config(state=tk.NORMAL)
         self.text_area.delete("1.0", tk.END)
@@ -57,15 +50,20 @@ class BoardPopup:
     def send_message(self):
         msg = self.entry.get().strip()
         if msg:
-            try:
-                requests.post(f"{self.client.server_url}/chat", json={
-                    "room_id": self.client.room_id,
-                    "name": self.client.player_name,
-                    "message": msg
-                })
+            if self.client.is_cpu_mode:
+                # CPUモードの時はローカルチャットに流す
+                self.client.local_room.chat_logs.append(f"【{self.client.player_name}】: {msg}")
                 self.entry.delete(0, tk.END)
-            except:
-                pass
+            else:
+                try:
+                    requests.post(f"{self.client.server_url}/chat", json={
+                        "room_id": self.client.room_id,
+                        "name": self.client.player_name,
+                        "message": msg
+                    })
+                    self.entry.delete(0, tk.END)
+                except:
+                    pass
 
 class TexasHoldemGUI:
     def __init__(self, root):
@@ -84,27 +82,57 @@ class TexasHoldemGUI:
         self.room_id = None
         self.player_id = None
         
-        self.chip_flow_text = "サーバー接続待ち..."
+        self.is_cpu_mode = False
+        self.local_room = None
+        
+        self.chip_flow_text = "モード選択待ち..."
         self.state_data = {}
 
         self.setup_ui()
-        self.prompt_connection()
+        self.prompt_mode_selection()
 
-    def prompt_connection(self):
-        url = simpledialog.askstring("接続設定", "RenderのWebサービスURLを入力してください:\n(ローカル検証なら http://localhost:5000)", parent=self.root)
-        if url: self.server_url = url.rstrip("/")
+    def prompt_mode_selection(self):
+        # モード選択の確認
+        mode_choice = messagebox.askyesnocancel("モード選択", "オンライン対人戦をプレイしますか？\n\n【はい】 -> 対人戦\n【いいえ】 -> CPU戦\n【キャンセル】 -> 終了")
+        
+        if mode_choice is None:
+            self.root.quit()
+            sys.exit(0)
+            
         name = simpledialog.askstring("名前入力", "あなたの名前を入力してください:", parent=self.root)
         if name: self.player_name = name
-        
-        try:
-            res = requests.post(f"{self.server_url}/join", json={"name": self.player_name}).json()
-            self.room_id = res["room_id"]
-            self.player_id = res["player_id"]
-            self.chip_flow_text = f"部屋 [{self.room_id}] に入室しました。対戦相手を待っています..."
+
+        target_p = simpledialog.askinteger("参加人数", "何人プレイにしますか？ (2〜6人):", parent=self.root, minvalue=2, maxvalue=6)
+        if not target_p: target_p = 2
+
+        if mode_choice:  # 対人戦モード
+            self.is_cpu_mode = False
+            url = simpledialog.askstring("接続設定", "RenderのWebサービスURLを入力してください:\n(ローカル検証なら http://localhost:5000)", parent=self.root)
+            if url: self.server_url = url.rstrip("/")
+            
+            try:
+                # サーバー側へ目標人数（target_players）も一緒に送るようにHTTPリクエストを少し拡張
+                # 今回のserver.pyは既存のassign_roomを叩きます（server側は自動的に引数を受け取ります）
+                res = requests.post(f"{self.server_url}/join", json={"name": self.player_name}).json()
+                self.room_id = res["room_id"]
+                self.player_id = res["player_id"]
+                self.chip_flow_text = f"部屋 [{self.room_id}] に入室しました。指定の人数 ({target_p}人) が揃うまでお待ちください..."
+                self.poll_server_loop()
+            except Exception as e:
+                self.chip_flow_text = "❌ サーバーへの接続に失敗しました。"
+                self.refresh_table("エラー")
+        else:  # CPU戦モード
+            self.is_cpu_mode = True
+            from controller import OnlinePokerRoom
+            self.local_room = OnlinePokerRoom(room_id=999, target_players=target_p)
+            self.player_id = self.local_room.add_player(self.player_name, is_human=True)
+            
+            # 残りの枠をCPUで埋める
+            for cpu_idx in range(1, target_p):
+                self.local_room.add_player(f"CPU-{cpu_idx}", is_human=False)
+                
+            self.chip_flow_text = f"ローカルCPU戦を開始しました ({target_p}人プレイ)"
             self.poll_server_loop()
-        except Exception as e:
-            self.chip_flow_text = "❌ サーバーへの接続に失敗しました。"
-            self.refresh_table("エラー")
 
     def setup_ui(self):
         self.top_frame = tk.Frame(self.root, bg="#0d241c", height=45)
@@ -135,18 +163,32 @@ class TexasHoldemGUI:
         self.board_popup = BoardPopup(self.root, self)
 
     def poll_server_loop(self):
-        if self.room_id is not None:
-            try:
-                res = requests.get(f"{self.server_url}/state", params={"room_id": self.room_id, "player_id": self.player_id}).json()
-                self.state_data = res
-                if res.get("game_started"):
-                    self.announcement_label.config(text=f"部屋 [{self.room_id}] プレイ中")
-                    self.append_log(res.get("action_logs", []))
-                    self.board_popup.update_chat_logs(res.get("chat_logs", []))
-                    self.refresh_table(res.get("round_name", ""))
-            except Exception as e:
-                pass
-        self.root.after(800, self.poll_server_loop)
+        if self.is_cpu_mode:
+            # CPU戦ならローカルのルームから状態を即座に引っこ抜く
+            res = self.local_room.get_state(self.player_id)
+            self.state_data = res
+            self.append_log(res.get("action_logs", []))
+            self.board_popup.update_chat_logs(res.get("chat_logs", []))
+            self.refresh_table(res.get("round_name", ""))
+            # CPU戦は同期が早いため少し短めの間隔で更新
+            self.root.after(400, self.poll_server_loop)
+        else:
+            if self.room_id is not None:
+                try:
+                    res = requests.get(f"{self.server_url}/state", params={"room_id": self.room_id, "player_id": self.player_id}).json()
+                    self.state_data = res
+                    if res.get("game_started"):
+                        self.announcement_label.config(text=f"部屋 [{self.room_id}] オンライン対戦中")
+                        self.append_log(res.get("action_logs", []))
+                        self.board_popup.update_chat_logs(res.get("chat_logs", []))
+                        self.refresh_table(res.get("round_name", ""))
+                    else:
+                        # まだ始まっていない場合は待機画面を描画
+                        self.canvas.delete("all")
+                        self.canvas.create_text(475, 220, text=f"⏳ 他のプレイヤーを待っています...\n\n現在の参加人数: {len(res.get('players', []))} 人", fill="white", font=("MS Gothic", 16, "bold"), justify="center")
+                except Exception as e:
+                    pass
+            self.root.after(800, self.poll_server_loop)
 
     def draw_card_object(self, cx, cy, card_data, is_hidden=False):
         card_w, card_h = 36, 50
@@ -243,15 +285,18 @@ class TexasHoldemGUI:
             tk.Scale(btn_frame, from_=min_in, to=max_in, orient="horizontal", variable=self.raise_amount_var, bg="#123026", fg="white", highlightthickness=0, length=120).pack(side="left", padx=5)
 
     def submit_action(self, act_type, amount):
-        try:
-            requests.post(f"{self.server_url}/action", json={
-                "room_id": self.room_id,
-                "player_id": self.player_id,
-                "act_type": act_type,
-                "amount": amount
-            })
-        except:
-            pass
+        if self.is_cpu_mode:
+            self.local_room.handle_action(self.player_id, act_type, amount)
+        else:
+            try:
+                requests.post(f"{self.server_url}/action", json={
+                    "room_id": self.room_id,
+                    "player_id": self.player_id,
+                    "act_type": act_type,
+                    "amount": amount
+                })
+            except:
+                pass
 
     def draw_intermission_ui(self, width, height):
         self.control_panel.place(x=width/2 - 160, y=height/2 - 50, width=320, height=100)
@@ -261,10 +306,14 @@ class TexasHoldemGUI:
         tk.Button(f, text="次戦へ進む", bg="#a5d6a7", width=12, font=("MS Gothic", 9, "bold"), command=self.submit_intermission).pack(side="left", padx=10)
 
     def submit_intermission(self):
-        try:
-            requests.post(f"{self.server_url}/intermission", json={"room_id": self.room_id})
-        except:
-            pass
+        if self.is_cpu_mode:
+            if self.local_room.show_intermission:
+                self.local_room.start_new_game()
+        else:
+            try:
+                requests.post(f"{self.server_url}/intermission", json={"room_id": self.room_id})
+            except:
+                pass
 
     def append_log(self, messages):
         self.log_text.config(state="normal")

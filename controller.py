@@ -41,7 +41,7 @@ class Deck:
         return [self.cards.pop() for _ in range(n)]
 
 class Player:
-    def __init__(self, player_id, name, chips=1000):
+    def __init__(self, player_id, name, chips=1000, is_human=True):
         self.id = player_id
         self.name = name
         self.chips = chips          
@@ -53,6 +53,7 @@ class Player:
         self.acted = False          
         self.score = (-1,)          
         self.hand_name = ""        
+        self.is_human = is_human  # CPU戦の判定用
 
     def reset_for_new_round(self):
         self.round_bet = 0
@@ -171,7 +172,7 @@ def evaluate_7_cards(cards):
     return best_score, best_hand_name
 
 class OnlinePokerRoom:
-    def __init__(self, room_id):
+    def __init__(self, room_id, target_players=2):
         self.room_id = room_id
         self.players = []  
         self.board = []
@@ -191,22 +192,18 @@ class OnlinePokerRoom:
         self.games_count = 0
         self.show_intermission = False
         
-        self.max_players = 6  # ★ 最大参加人数を6人に拡張
+        self.target_players = target_players  # ★ 指定の開始人数
 
-    def add_player(self, name):
-        if len(self.players) >= self.max_players or self.game_started: return None
+    def add_player(self, name, is_human=True):
+        if len(self.players) >= self.target_players or self.game_started: return None
         p_id = len(self.players)
-        p = Player(p_id, name)
+        p = Player(p_id, name, is_human=is_human)
         self.players.append(p)
-        self.action_logs.append(f"📢 {name} が入室しました。({len(self.players)}/{self.max_players})")
+        self.action_logs.append(f"📢 {name} が参加しました。({len(self.players)}/{self.target_players})")
         
-        # ★ 最初の2人が揃った時点で、ゲーム開始トリガー（手動または30秒後開始などに拡張可能ですが、ここでは集まり次第すぐ遊べるよう2名以上で、まずは保持します。全員揃ってから開始したい場合は、ここをコメントアウトして、開始用APIを叩く運用にすることも可能です）
-        if len(self.players) == 2:
+        # ★ 特定の人数（目標人数）が集まった瞬間に開始
+        if len(self.players) == self.target_players:
             self.start_new_game()
-        elif self.game_started:
-            # 既に始まっている場合は途中参入不可（観戦状態にするなど）
-            pass
-            
         return p_id
 
     def start_new_game(self):
@@ -225,13 +222,11 @@ class OnlinePokerRoom:
             self.round_name = "ゲーム終了"
             return
 
-        # 次の生存しているディーラーを探す
         while True:
             self.dealer_idx = (self.dealer_idx + 1) % len(self.players)
             if not self.players[self.dealer_idx].is_busted:
                 break
 
-        # ★ 3人以上のブラインド位置計算ロジック（CUI版を完全移植）
         num_living = len(living)
         idx_in_actives = living.index(self.players[self.dealer_idx])
         
@@ -272,7 +267,6 @@ class OnlinePokerRoom:
         self.highest_bet = max(p.round_bet for p in self.players)
         self.min_raise_increment = self.rules.MIN_RAISE_INCREMENT
         
-        # ★ 3人以上時のアクション開始位置の計算（CUI版完全再現）
         living = [p for p in self.players if not p.is_busted]
         num_living = len(living)
         idx_in_actives = living.index(self.players[self.dealer_idx])
@@ -313,6 +307,24 @@ class OnlinePokerRoom:
             return
 
         self.current_turn_player_id = p.id
+        
+        # ★ もしCPUのターンなら、自動で即座に行動を決定するロジックを発動
+        if not p.is_human:
+            self.think_cpu_action(p)
+
+    def think_cpu_action(self, cpu_player):
+        """簡単なCPU思考ロジック"""
+        to_call = min(self.highest_bet - cpu_player.round_bet, cpu_player.chips)
+        # コール額が0ならチェック、それ以外なら確率でコールかフォールド
+        if to_call == 0:
+            act, amnt = "call", 0
+        else:
+            # 70%の確率でコール、30%でフォールド
+            if random.random() < 0.7:
+                act, amnt = "call", to_call
+            else:
+                act, amnt = "fold", 0
+        self.handle_action(cpu_player.id, act, amnt)
 
     def handle_action(self, p_id, act_type, amount):
         if self.current_turn_player_id != p_id: return False
@@ -429,16 +441,18 @@ class RoomManager:
         self.rooms = {}
         self.next_room_id = 1
 
-    def assign_room(self, player_name):
+    def assign_room(self, player_name, target_players=2):
+        # 目標人数が一致しており、まだ満員になっていない待機中の部屋を探す
         for r_id, room in self.rooms.items():
-            if len(room.players) < room.max_players and not room.game_started:
-                p_id = room.add_player(player_name)
+            if room.target_players == target_players and len(room.players) < room.target_players and not room.game_started:
+                p_id = room.add_player(player_name, is_human=True)
                 return r_id, p_id
+        # なければ新しい設定で部屋を作る
         r_id = self.next_room_id
         self.next_room_id += 1
-        room = OnlinePokerRoom(r_id)
+        room = OnlinePokerRoom(r_id, target_players=target_players)
         self.rooms[r_id] = room
-        p_id = room.add_player(player_name)
+        p_id = room.add_player(player_name, is_human=True)
         return r_id, p_id
 
 manager = RoomManager()
