@@ -2,6 +2,13 @@ import os
 from flask import Flask, request, jsonify
 from controller import manager
 
+# Renderの環境変数からトークンを取得する
+ACCESS_TOKEN = os.environ.get("POKER_SECRET_TOKEN")
+
+# 【セキュリティチェック】もしトークンが設定されていなければエラー警告を出す
+if not ACCESS_TOKEN:
+    print("⚠️ 警告: 環境変数 'POKER_SECRET_TOKEN' が設定されていません！")
+
 app = Flask(__name__)
 
 @app.route("/join", methods=["POST"])
